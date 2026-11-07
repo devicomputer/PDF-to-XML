@@ -9,7 +9,6 @@ import pandas as pd
 import json
 from datetime import datetime
 import io
-from datetime import datetime
 
 # ==========================================
 # ENGINE 1: IDBI BANK PARSER
@@ -47,7 +46,7 @@ def parse_idbi_bank(raw_text):
                 "Balance": match.group(5)
             })
             
-    # 🌟 IDBI Bank Data Reversal Patch for Tally XML
+    # Reverse data from newest-first to oldest-first for chronological reconciliation and Tally
     return entries[::-1]
 
 # ==========================================
@@ -270,7 +269,7 @@ def parse_au_bank(raw_text):
     entries = []
     clean_text = raw_text.replace('\r', '')
     
-    amt_matches = list(re.finditer(r'\b([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\b', clean_text))
+    amt_matches = list(re.finditer(r'(\d[\d,]*\.\d{2})\s+([\d,]+\.\d{2})', clean_text))
     date_matches = list(re.finditer(r'(\d{2}\s[A-Za-z]{3}\s\d{4})\s\d{2}\s[A-Za-z]{3}\s\d{4}', clean_text))
     
     junk_keywords = [
@@ -593,7 +592,6 @@ def master_parser(selected_bank, raw_text):
 # ==========================================
 def master_excel_parser(selected_bank, df_raw):
     entries = []
-    
     header_idx = -1
     for idx, row in df_raw.iterrows():
         row_str = " ".join([str(val).lower() for val in row.values])
@@ -651,15 +649,14 @@ def generate_tally_xml(entries, selected_bank, rules):
         is_deemed_positive = "Yes" if debit else "No"
         narration = saxutils.escape(entry.get("Particulars / Narration", ""))
         
-        # 🌟 1. SMART LEDGER MAPPING LOGIC
-        target_ledger = "Suspense A/c" # Default
+        # 1. Smart Ledger Mapping Logic
+        target_ledger = "Suspense A/c"
         for keyword, mapped_ledger in rules.items():
             if keyword.upper() in narration.upper():
                 target_ledger = saxutils.escape(mapped_ledger)
                 break 
                 
-        # 🌟 2. CONTRA VOUCHER LOGIC (The Tally Rule)
-        # अगर लेजर का नाम Cash है, तो Payment/Receipt की जगह Contra वाउचर बनेगा
+        # 2. Contra Voucher Logic (Tally rule for Cash/ATM)
         if target_ledger.upper() in ["CASH", "CASH A/C", "CASH IN HAND"]:
             vch_type = "Contra"
         else:
@@ -727,6 +724,7 @@ st.title("Multi-Bank Statement to Tally XML 🧾")
 
 if 'raw_text' not in st.session_state: st.session_state.raw_text = None
 if 'parsed_data' not in st.session_state: st.session_state.parsed_data = None
+if 'edited_data' not in st.session_state: st.session_state.edited_data = None
 
 st.markdown("---")
 
@@ -823,6 +821,7 @@ if selected_bank:
 
                     status_text.success("✅ Extraction Complete! Scroll down to review.")
                     st.session_state.parsed_data = all_parsed_entries
+                    st.session_state.edited_data = all_parsed_entries
                     
                 except Exception as e:
                     error_msg = str(e).lower()
@@ -835,7 +834,7 @@ if selected_bank:
                         os.remove(temp_pdf_path)
 
 # ==========================================
-# STEP 2: PREVIEW DATA (AUDIT MODE)
+# STEP 2: PREVIEW DATA (AUDIT & EDIT MODE)
 # ==========================================
 if st.session_state.parsed_data is not None:
     st.markdown("---")
@@ -843,7 +842,7 @@ if st.session_state.parsed_data is not None:
     
     col_title, col_metric = st.columns([3, 1])
     with col_title:
-        st.subheader("Step 2: Review Extracted Data (Audit Mode 🔍)")
+        st.subheader("Step 2: Review & Edit Data (Audit Mode 🔍)")
     with col_metric:
         st.success(f"✅ Total Entries Found: **{total_entries}**")
     
@@ -881,18 +880,28 @@ if st.session_state.parsed_data is not None:
             
         styled_df = df.style.apply(highlight_errors, axis=1)
 
-        st.dataframe(
+        st.info("💡 **PRO TIP:** You can double-click any cell to **Edit** values directly, or scroll down to the bottom of the table to **Add** a missing entry.")
+
+        edited_df = st.data_editor(
             styled_df, 
             use_container_width=True, 
-            height=800,
+            height=600,
+            num_rows="dynamic",
             column_config={
                 "Particulars / Narration": st.column_config.TextColumn(width="large"),
                 "Recon_Error": None
             }
         )
         
+        if 'Recon_Error' in edited_df.columns:
+            clean_df = edited_df.drop(columns=['Recon_Error'])
+        else:
+            clean_df = edited_df
+            
+        st.session_state.edited_data = clean_df.to_dict('records')
+        
         if any(is_error):
-            st.error("⚠️ **Reconciliation Alert:** Calculation mismatch detected for some entries (highlighted in red). Please verify the amounts from the original document. An entry might have been skipped due to a page break.")
+            st.error("⚠️ **Reconciliation Alert:** Calculation mismatch detected for some entries (highlighted in red). You can double-click cells in the table above to manually correct amounts or add missing rows.")
     else:
         st.warning(f"No transactions detected. Please ensure you selected the correct bank ({selected_bank}).")
         
@@ -907,13 +916,11 @@ if st.session_state.parsed_data is not None:
         st.markdown("---")
         st.subheader("Step 3: Smart Ledger Mapping & XML")
         
-        # 🌟 Rule Engine Database Management
         RULE_FILE = "ledger_rules.json"
         
         def load_rules():
             if os.path.exists(RULE_FILE):
                 with open(RULE_FILE, "r") as f: return json.load(f)
-            # 🌟 CONTRA वाउचर के लिए ATM और CASH का डिफ़ॉल्ट रूल
             return {"SBI CARDS": "Credit Card", "JIO": "Telephone Expenses", "ATM": "Cash", "CASH": "Cash"}
             
         def save_rules(r):
@@ -922,7 +929,6 @@ if st.session_state.parsed_data is not None:
         if 'ledger_rules' not in st.session_state:
             st.session_state.ledger_rules = load_rules()
 
-        # 🌟 UI FOR ADDING NEW RULES
         with st.expander("🧠 Setup Smart Ledger Rules (Keyword -> Ledger)", expanded=False):
             col_k, col_l, col_b = st.columns([2, 2, 1])
             with col_k:
@@ -930,7 +936,7 @@ if st.session_state.parsed_data is not None:
             with col_l:
                 new_ledger = st.text_input("Tally Ledger Name (e.g. Office Expense)", placeholder="Enter ledger name...")
             with col_b:
-                st.markdown("<br>", unsafe_allow_html=True) # spacing
+                st.markdown("<br>", unsafe_allow_html=True) 
                 if st.button("➕ Add Rule"):
                     if new_keyword and new_ledger:
                         st.session_state.ledger_rules[new_keyword] = new_ledger
@@ -938,32 +944,26 @@ if st.session_state.parsed_data is not None:
                         st.success(f"Rule Added: {new_keyword} ➔ {new_ledger}")
                         st.rerun() 
                     else:
-                        st.error("Fill both fields!")
+                        st.error("Please fill both fields!")
                         
-            # Show existing rules
             if st.session_state.ledger_rules:
                 st.markdown("**Current Active Rules:**")
                 for kw, ld in st.session_state.ledger_rules.items():
                     st.code(f"IF narration contains '{kw}' ➔ SET Ledger as '{ld}'")
 
-        # ====================================================
-        # 🌟 NEW FEATURE: DATE RANGE FILTER 📅
-        # ====================================================
+        # Date Range Filter
         st.markdown("### 📅 Filter Transactions by Date")
         
-        # स्ट्रिंग (DD/MM/YYYY) को असली Python Date में बदलना
         def parse_dt(d_str):
-            try: return datetime.strptime(d_str, "%d/%m/%Y").date()
+            try: return datetime.strptime(str(d_str), "%d/%m/%Y").date()
             except: return None
         
-        # डेटा में से सबसे पुरानी और सबसे नई तारीख ढूँढना
-        all_dates = [parse_dt(e["Date"]) for e in st.session_state.parsed_data if parse_dt(e["Date"])]
+        all_dates = [parse_dt(e["Date"]) for e in st.session_state.edited_data if parse_dt(e["Date"])]
         if all_dates:
             min_dt, max_dt = min(all_dates), max(all_dates)
         else:
             min_dt, max_dt = datetime.today().date(), datetime.today().date()
 
-        # Streamlit Date Picker UI
         selected_dates = st.date_input(
             "Select Date Range for XML Generation:",
             value=(min_dt, max_dt),
@@ -974,7 +974,6 @@ if st.session_state.parsed_data is not None:
         
         st.markdown("---")
         
-        # 🌟 Tally Bank Ledger Input
         default_ledger_name = f"{selected_bank} Account"
         tally_ledger_name = st.text_input(
             "Tally Bank Ledger Name:", 
@@ -982,38 +981,34 @@ if st.session_state.parsed_data is not None:
             help="Type the EXACT bank ledger name as created in your Tally ERP 9 / Prime"
         )
         
-        # 🌟 Confirm Button & Dual Export (XML + Excel)
         if st.button("⚙️ Confirm & Generate Files"):
             with st.spinner("Generating Tally XML and Excel Files..."):
                 try:
-                    # 🌟 DATE FILTERING LOGIC
                     filtered_data = []
                     if len(selected_dates) == 2:
                         start_dt, end_dt = selected_dates
-                        for entry in st.session_state.parsed_data:
+                        for entry in st.session_state.edited_data:
                             edt = parse_dt(entry["Date"])
                             if edt is None or (start_dt <= edt <= end_dt):
                                 filtered_data.append(entry)
                     else:
-                        filtered_data = st.session_state.parsed_data
+                        filtered_data = st.session_state.edited_data
 
                     if len(filtered_data) == 0:
-                        st.error("❌ चुनी गई तारीखों के बीच कोई ट्रांज़ैक्शन नहीं है!")
+                        st.error("❌ No transactions found within the selected date range!")
                     else:
-                        # 1. XML GENERATION
+                        # 1. XML Generation
                         tally_xml = generate_tally_xml(filtered_data, tally_ledger_name, st.session_state.ledger_rules)
                         
-                        # 2. EXCEL GENERATION (In-Memory)
+                        # 2. Excel Generation (In-Memory)
                         df_export = pd.DataFrame(filtered_data)
                         excel_buffer = io.BytesIO()
-                        # हमने openpyxl इंजन का उपयोग किया है जो आपने पहले ही इंस्टॉल कर रखा है
                         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                             df_export.to_excel(writer, index=False, sheet_name='Bank_Data')
                         excel_data = excel_buffer.getvalue()
                         
                         st.success(f"✅ Successfully Generated for {len(filtered_data)} entries! 🚀")
                         
-                        # 🌟 DUAL DOWNLOAD BUTTONS (UI Layout)
                         col_xml, col_excel = st.columns(2)
                         with col_xml:
                             st.download_button(
